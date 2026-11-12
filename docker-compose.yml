@@ -1,0 +1,79 @@
+# docker compose up --build
+# Secrets (STRIPE_WEBHOOK_SECRET, STRIPE_API_KEY, ADMIN_TOKEN) are read from your .env file.
+
+x-relay-env: &relay-env
+  DATABASE_URL: postgresql+psycopg://relay:relay@postgres:5432/relay
+  REDIS_URL: redis://redis:6379/0
+  DOWNSTREAM_URL: http://merchant:9000/events
+
+x-python-healthcheck: &py-health
+  interval: 5s
+  timeout: 3s
+  retries: 10
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: relay
+      POSTGRES_PASSWORD: relay
+      POSTGRES_DB: relay
+    ports: ["5433:5432"] # host 5433, so it doesn't clash with a locally installed PostgreSQL
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U relay -d relay"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    env_file: [{ path: .env, required: false }]
+    environment: *relay-env
+    ports: ["8000:8000"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      <<: *py-health
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: ["python", "-m", "app.worker"]
+    env_file: [{ path: .env, required: false }]
+    environment: *relay-env
+    depends_on:
+      api: { condition: service_healthy } # api creates the tables first
+      merchant: { condition: service_healthy }
+    restart: unless-stopped
+
+  reconciler:
+    build: .
+    command: ["python", "-m", "app.reconcile"]
+    env_file: [{ path: .env, required: false }]
+    environment: *relay-env
+    depends_on:
+      api: { condition: service_healthy }
+      redis: { condition: service_healthy }
+    restart: unless-stopped
+
+  merchant:
+    build: .
+    command: ["python", "demo/merchant.py"]
+    ports: ["9000:9000"]
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:9000/health')"]
+      <<: *py-health
+    restart: unless-stopped
+
+volumes:
+  pgdata:
